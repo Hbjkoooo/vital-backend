@@ -32,10 +32,8 @@ app.use((err, req, res, next) => {
 
 const start = async () => {
   await connect();
-  if (process.env.NODE_ENV === 'development') {
-    await sequelize.sync({ alter: true });
-    console.log('✅ 数据库表同步完成');
-  }
+ await sequelize.sync({ alter: true });
+console.log('✅ 数据库表同步完成');
   const PORT = process.env.PORT || 3000;
   app.listen(PORT, () => {
     console.log(`✅ Vitalic Server running on :${PORT}  [${process.env.NODE_ENV}]`);

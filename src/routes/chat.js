@@ -15,6 +15,7 @@ const router  = express.Router();
 const { ChatSession, ChatMessage, Indicator, HealthProfile, Report } = require('../db/models');
 const { chatWithReport, chatWithAssistant, chatForGoalSetup, finalizeGoals } = require('../chains/chatChain');
 const { indicatorsToText } = require('../parsers/indicatorParser');
+const { Op } = require('sequelize');
 
 // ── 工具：保存消息 ─────────────────────────────────────────────
 const saveMessages = async (sessionId, userInput, aiReply) => {
@@ -27,6 +28,7 @@ const saveMessages = async (sessionId, userInput, aiReply) => {
 
 // ── 工具：构建历史消息数组 ─────────────────────────────────────
 const buildHistory = async (sessionId, limit = 10) => {
+  if (!sessionId) return [];  // ✅ 添加这一行
   const msgs = await ChatMessage.findAll({
     where: { session_id: sessionId },
     order: [['created_at', 'DESC']],
@@ -35,57 +37,76 @@ const buildHistory = async (sessionId, limit = 10) => {
   return msgs.reverse().map(m => ({ role: m.role, content: m.content }));
 };
 
-// ── 报告对话 ──────────────────────────────────────────────────
 router.post('/report', async (req, res, next) => {
   try {
     const { input, sessionId, reportId, userId } = req.body;
     if (!input?.trim()) return res.status(400).json({ code: -1, msg: '消息不能为空' });
 
     const [history, report, profile] = await Promise.all([
-      buildHistory(sessionId),
+      sessionId ? buildHistory(sessionId) : Promise.resolve([]),
       Report.findByPk(reportId, { include: [{ model: require('../db/models').Indicator, as: 'indicators' }] }),
       HealthProfile.findOne({ where: { user_id: userId } }),
     ]);
-
+    // 加这行
+console.log('[chatWithReport] indicators:', JSON.stringify(report?.indicators?.map(i => `${i.indicator_label}:${i.value}${i.unit}`), null, 2));
+console.log('[chatWithReport] chiefComplaint:', report?.chief_complaint);
     const reply = await chatWithReport(input, history, {
       indicators:    report?.indicators || [],
       reportSummary: report?.summary || '',
+      chiefComplaints: report?.chief_complaint || '',  // ← 加这行
       userProfile:   profile || {},
     });
 
     if (sessionId) await saveMessages(sessionId, input, reply);
-
     res.json({ code: 0, data: { reply } });
   } catch (e) { next(e); }
 });
 
-// ── 日常助手对话 ──────────────────────────────────────────────
 router.post('/assistant', async (req, res, next) => {
   try {
     const { input, sessionId, userId } = req.body;
     if (!input?.trim()) return res.status(400).json({ code: -1, msg: '消息不能为空' });
 
+   // 改后
+const recentReports = await Report.findAll({
+  where: { user_id: userId },
+  order: [['report_date', 'DESC']],
+  limit: 2,
+  attributes: ['id', 'report_date', 'chief_complaint'],
+});
+const recentReportIds = recentReports.map(r => r.id);
+const chiefComplaints = recentReports
+  .filter(r => r.chief_complaint)
+  .map(r => `${r.report_date}：${r.chief_complaint}`)
+  .join('\n') || '暂无';
+
     const [history, profile, recentIndicators] = await Promise.all([
       sessionId ? buildHistory(sessionId) : Promise.resolve([]),
       HealthProfile.findOne({ where: { user_id: userId } }),
       Indicator.findAll({
-        where:  { user_id: userId },
-        order:  [['record_date', 'DESC']],
-        limit:  30,
+        where: {
+          user_id: userId,
+          [Op.or]: [
+            { report_id: recentReportIds },
+            { is_core: true },
+          ],
+        },
+        order: [['record_date', 'DESC']],
       }),
     ]);
 
+    console.log('[assistant] indicators:\n', recentIndicators.map(i => `${i.record_date} | ${i.indicator_label}:${i.value}${i.unit}`).join('\n'));
+
     const reply = await chatWithAssistant(input, history, {
-      userProfile:       profile || {},
+      userProfile:      profile || {},
       recentIndicators,
+      chiefComplaints,
     });
 
     if (sessionId) await saveMessages(sessionId, input, reply);
-
     res.json({ code: 0, data: { reply } });
   } catch (e) { next(e); }
 });
-
 // ── 目标设置对话 ──────────────────────────────────────────────
 router.post('/goal', async (req, res, next) => {
   try {
@@ -101,6 +122,9 @@ router.post('/goal', async (req, res, next) => {
       userProfile:        profile || {},
       abnormalIndicators: abnormals,
     });
+    // 加这两行
+console.log('[goal] user:', input);
+console.log('[goal] assistant:', reply);
 
     res.json({ code: 0, data: { reply } });
   } catch (e) { next(e); }
@@ -154,4 +178,18 @@ router.get('/session/:id/messages', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+router.put('/session/:id/title', async (req, res, next) => {
+  try {
+    const { title } = req.body;
+    await ChatSession.update({ title }, { where: { id: req.params.id } });
+    res.json({ code: 0 });
+  } catch (e) { next(e); }
+});
+router.delete('/session/:id', async (req, res, next) => {
+  try {
+    await ChatMessage.destroy({ where: { session_id: req.params.id } });
+    await ChatSession.destroy({ where: { id: req.params.id } });
+    res.json({ code: 0 });
+  } catch (e) { next(e); }
+});
 module.exports = router;

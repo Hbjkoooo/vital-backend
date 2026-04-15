@@ -13,7 +13,16 @@ const router  = express.Router();
 const { Op }  = require('sequelize');
 const { User, HealthProfile, Report, Indicator, HealthGoal, CheckinRecord } = require('../db/models');
 const { generateDailyTip } = require('../chains/dailyChain');
-
+const shouldShowToday = (frequency) => {
+  if (!frequency || frequency === '每天') return true;
+  const weekdays = ['周日','周一','周二','周三','周四','周五','周六'];
+  const todayName = weekdays[new Date().getDay()];
+  if (frequency === '工作日') return ['周一','周二','周三','周四','周五'].includes(todayName);
+  if (frequency.includes(',')) return frequency.split(',').map(f => f.trim()).includes(todayName);
+  if (weekdays.includes(frequency)) return frequency === todayName;
+  if (frequency.startsWith('每周')) return frequency.includes(todayName);
+  return true;
+};
 // ── 登录/注册（微信云函数获取 openid 后调用此接口）
 router.post('/login', async (req, res, next) => {
   try {
@@ -24,8 +33,22 @@ router.post('/login', async (req, res, next) => {
       where:    { openid },
       defaults: { nickname, avatar_url: avatarUrl },
     });
+      // ✅ 如果不是新用户，且传了头像/昵称，则更新
+      if (!created && (nickname || avatarUrl)) {
+        const updateData = {};
+        if (nickname) updateData.nickname = nickname;
+        if (avatarUrl) updateData.avatar_url = avatarUrl;
+        await user.update(updateData);
+      }
 
-    res.json({ code: 0, data: { userId: user.id, isNewUser: created, isProfileComplete: user.is_profile_complete } });
+    res.json({ code: 0, data: {
+       userId: user.id, isNewUser: created, isProfileComplete: user.is_profile_complete,
+       nickname:user.nickname,
+       avatarUrl:user.avatar_url,
+
+      
+      
+      } });
   } catch (e) { next(e); }
 });
 
@@ -47,8 +70,17 @@ router.post('/profile', async (req, res, next) => {
 // ── 获取健康画像
 router.get('/profile', async (req, res, next) => {
   try {
+    const user = await User.findByPk(req.query.userId, {
+      attributes: ['nickname', 'avatar_url', ['created_at', 'createdAt']  ]
+    })
     const profile = await HealthProfile.findOne({ where: { user_id: req.query.userId } });
-    res.json({ code: 0, data: profile });
+    res.json({ code: 0, data: { 
+      ...profile?.dataValues,
+      nickname: user?.nickname,
+      avatarUrl: user?.avatar_url,
+      createdAt: user?.createdAt,
+    }})
+    
   } catch (e) { next(e); }
 });
 
@@ -61,31 +93,67 @@ router.get('/dashboard', async (req, res, next) => {
     const [profile, latestReport, recentIndicators] = await Promise.all([
       HealthProfile.findOne({ where: { user_id: userId } }),
       Report.findOne({
-        where: { user_id: userId, status: 'report_ready' },
+        where: { 
+          user_id: userId, 
+          status: { [Op.in]: ['analyzed', 'report_ready', 'ocr_done'] }
+        },
         order: [['report_date', 'DESC']],
-        attributes: ['id', 'title', 'report_date', 'summary', 'health_score', 'report_cache'],
+        attributes: ['id', 'title', 'report_date', 'summary', 'health_score', 'template_cache'],
       }),
-      Indicator.findAll({ where: { user_id: userId }, order: [['record_date', 'DESC']], limit: 50 }),
+      Indicator.findAll({ 
+        where: { user_id: userId }, 
+        order: [['record_date', 'DESC']], 
+        limit: 100 
+      }),
     ]);
 
     // 今日每日科普（每天只生成一次，实际项目可加缓存）
     let dailyTip = '';
-    try {
-      dailyTip = await generateDailyTip(profile || {}, recentIndicators);
-    } catch (e) {
-      dailyTip = '保持均衡饮食，每天适量运动，有助于维持健康的血糖和血脂水平。';
+    if (profile?.daily_tip && profile?.daily_tip_date === today) {
+      dailyTip = profile.daily_tip;
+    } else {
+      try {
+        dailyTip = await generateDailyTip(profile || {}, recentIndicators);
+        if (profile) {
+          await HealthProfile.update(
+            { daily_tip: dailyTip, daily_tip_date: today },
+            { where: { user_id: userId } }
+          );
+        }
+      } catch (e) {
+        dailyTip = profile?.daily_tip || '保持均衡饮食，每天适量运动，有助于维持健康的血糖和血脂水平。';
+      }
     }
 
     // 趋势数据（5个关键指标各取最近6条，用于首页图表）
-    const KEY_METRICS = ['bloodGlucose', 'totalCholesterol', 'systolicBP', 'bmi', 'triglycerides'];
+    const LABEL_TO_KEY = {
+      '收缩压': 'systolicBP',
+      'systolicBloodPressure': 'systolicBP',  // ← 加这行
+      '空腹血糖': 'bloodGlucose',
+      '血糖': 'bloodGlucose',
+      '总胆固醇': 'totalCholesterol',
+      '甘油三酯': 'triglycerides',
+      '体重指数': 'bmi',
+      'BMI': 'bmi',
+    };
+    
     const trendData = {};
-    for (const key of KEY_METRICS) {
-      const records = recentIndicators
-        .filter(i => i.indicator_key === key)
-        .slice(0, 6)
-        .reverse()
-        .map(i => ({ date: i.record_date, value: i.value, unit: i.unit, isAbnormal: i.is_abnormal }));
-      if (records.length) trendData[key] = { records };
+    for (const ind of recentIndicators) {
+      const key = LABEL_TO_KEY[ind.indicator_label];
+      if (!key) continue;
+      if (!trendData[key]) trendData[key] = { records: [] };
+      if (trendData[key].records.length >= 6) continue;
+      trendData[key].records.push({
+        date: ind.record_date,
+        value: ind.value,
+        unit: ind.unit,
+        isAbnormal: ind.is_abnormal,
+      });
+    }
+    
+    // records已经是DESC顺序，反转成时间正序给图表用
+    for (const key of Object.keys(trendData)) {
+      trendData[key].records = trendData[key].records.reverse();
     }
 
     // 今日打卡任务
@@ -100,12 +168,34 @@ router.get('/dashboard', async (req, res, next) => {
     const doneSet = new Set(todayCheckins.filter(c => c.done).map(c => c.task_id));
 
     const todayTasks = goals.flatMap(g =>
-      g.tasks.map(t => ({
+      g.tasks
+      .filter(t => shouldShowToday(t.frequency))  // ← 加这行
+      .map(t => ({
         _id: t.id, title: t.title, goalTitle: g.title,
         source: g.source, done: doneSet.has(t.id),
       }))
     );
-
+    const METRIC_LABELS_CN = {
+      bloodGlucose: '血糖', totalCholesterol: '总胆固醇',
+      systolicBP: '收缩压', bmi: 'BMI', triglycerides: '甘油三酯'
+    }
+    // 加在 trendData 那个for循环之前
+console.log('[dashboard] is_core indicators:', recentIndicators.map(i => `${i.indicator_key}:${i.value}`).join(', '))
+    for (const key of Object.keys(trendData)){
+      if (!trendData[key]) continue
+      const records = trendData[key].records
+      const vals = records.map(r => r.value)
+      const latest = vals[vals.length - 1]
+      const first = vals[0]
+      const trend = latest > first * 1.05 ? '上升' : latest < first * 0.95 ? '下降' : '平稳'
+      const abnCnt = records.filter(r => r.isAbnormal).length
+      const unit = records[0].unit
+      const label = METRIC_LABELS_CN[key] || key
+      trendData[key].summary = `近期您的${label}整体呈${trend}趋势（${first}→${latest} ${unit}）` +
+      (abnCnt ? `，其中${abnCnt}次记录异常，建议关注。` : '，保持在正常范围内，继续保持。')
+    } 
+    console.log('[dashboard] trendData keys:', Object.keys(trendData));
+    console.log('[dashboard] trendData:', JSON.stringify(trendData));
     res.json({
       code: 0,
       data: {
@@ -128,7 +218,7 @@ router.get('/dashboard', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-// ── 指标趋势详情（论文：历史健康数据统计与可视化）
+// ── 指标趋势详情（论文：历史健康数据统计与可视化），暂时不用，首页直接返回更方便
 router.get('/indicators/trend', async (req, res, next) => {
   try {
     const { userId, indicatorKey, months = 6 } = req.query;

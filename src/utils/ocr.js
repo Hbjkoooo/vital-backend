@@ -120,20 +120,23 @@ const ocrPdf = async (pdfPath) => {
     throw new Error('PDF 转图片失败，请确认文件是否损坏');
   }
 
-  console.log(`[OCR] PDF 共 ${results.length} 页，开始识别...`);
+  console.log(`[OCR] PDF 共 ${results.length} 页，开始并行识别...`);
 
-  const pageTexts = [];
-  for (let i = 0; i < results.length; i++) {
-    const imgPath = results[i].path;
-    if (!imgPath || !fs.existsSync(imgPath)) {
-      console.warn(`[OCR] 第 ${i + 1} 页图片不存在，跳过`);
-      continue;
-    }
-    const base64 = fs.readFileSync(imgPath).toString('base64');
-    console.log(`[OCR] 正在识别第 ${i + 1}/${results.length} 页...`);
-    const text = await ocrImage(base64);
-    pageTexts.push(text);
-  }
+  // 并行识别所有页，保持页码顺序
+  const pageTexts = await Promise.all(
+    results.map(async (result, i) => {
+      const imgPath = result.path;
+      if (!imgPath || !fs.existsSync(imgPath)) {
+        console.warn(`[OCR] 第 ${i + 1} 页图片不存在，跳过`);
+        return '';
+      }
+      const base64 = fs.readFileSync(imgPath).toString('base64');
+      console.log(`[OCR] 并行识别第 ${i + 1}/${results.length} 页...`);
+      const text = await ocrImage(base64);
+      console.log(`[OCR] 第 ${i + 1} 页完成`);
+      return text;
+    })
+  );
 
   // 全部识别完再删
   fs.rmSync(tmpDir, { recursive: true, force: true });

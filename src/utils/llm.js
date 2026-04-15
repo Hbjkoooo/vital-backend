@@ -14,7 +14,7 @@ const getLLM = (opts = {}) => new ChatOpenAI({
 
 module.exports = {
   getLLM,
-  extractLLM:  getLLM({ temperature: 0.0, maxTokens: 2000 }),
-  analysisLLM: getLLM({ temperature: 0.2, maxTokens: 3000 }),
+  extractLLM:  getLLM({ temperature: 0.0, maxTokens: 8000 }),
+  analysisLLM: getLLM({ temperature: 0.2, maxTokens: 4000 }),
   chatLLM:     getLLM({ temperature: 0.7, maxTokens: 800  }),
 };

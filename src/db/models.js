@@ -7,7 +7,7 @@
  *   health_profiles  - 健康画像表
  *   reports          - 体检报告表
  *   indicators       - 健康指标表（长期趋势存储）
- *   report_sessions  - 报告对话 session 表
+ *   chat_sessions    - 对话 session 表
  *   chat_messages    - 对话消息表（报告对话 + 助手对话共用）
  *   health_goals     - 健康目标表
  *   goal_tasks       - 目标任务表
@@ -21,18 +21,21 @@ const { sequelize } = require('./index');
 // ============================================================
 const User = sequelize.define('User', {
   id:       { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
-  openid:   { type: DataTypes.STRING(64), allowNull: false, unique: true, comment: '微信 openid' },
+  openid:   { type: DataTypes.STRING(64), allowNull: false, comment: '微信 openid' },
   nickname: { type: DataTypes.STRING(50), defaultValue: '' },
   avatar_url: { type: DataTypes.STRING(500), defaultValue: '' },
   is_profile_complete: { type: DataTypes.BOOLEAN, defaultValue: false },
-}, { tableName: 'users' });
+}, { 
+  tableName: 'users',
+  indexes: [{ unique: true, fields: ['openid'], name: 'openid' }],
+});
 
 // ============================================================
 // 2. 健康画像表（与 users 1:1）
 // ============================================================
 const HealthProfile = sequelize.define('HealthProfile', {
   id:      { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
-  user_id: { type: DataTypes.INTEGER, allowNull: false, unique: true },
+  user_id: { type: DataTypes.INTEGER, allowNull: false },
 
   // 基础信息
   name:    { type: DataTypes.STRING(20), defaultValue: '' },
@@ -41,23 +44,29 @@ const HealthProfile = sequelize.define('HealthProfile', {
   height:  { type: DataTypes.FLOAT, comment: '身高 cm' },
   weight:  { type: DataTypes.FLOAT, comment: '体重 kg' },
 
-  // 生活习惯（论文要求）
-  occupation:     { type: DataTypes.STRING(50), defaultValue: '' },
-  work_intensity: { type: DataTypes.ENUM('sedentary', 'light', 'moderate', 'heavy'), defaultValue: 'sedentary' },
-  sleep_pattern:  { type: DataTypes.ENUM('early', 'normal', 'late', 'irregular'), defaultValue: 'normal' },
-  sleep_hours:    { type: DataTypes.FLOAT },
-  exercise_freq:  { type: DataTypes.ENUM('none', '1-2', '3+'), defaultValue: 'none' },
-  smoking_status: { type: DataTypes.ENUM('none', 'quit', 'occasional', 'daily'), defaultValue: 'none' },
-  drinking_status:{ type: DataTypes.ENUM('none', 'occasional', 'weekly', 'daily'), defaultValue: 'none' },
+  // 生活习惯
+  occupation:      { type: DataTypes.STRING(50), defaultValue: '' },
+  work_intensity:  { type: DataTypes.ENUM('sedentary', 'light', 'moderate', 'heavy'), defaultValue: 'sedentary' },
+  sleep_pattern:   { type: DataTypes.ENUM('early', 'normal', 'late', 'irregular'), defaultValue: 'normal' },
+  sleep_hours:     { type: DataTypes.FLOAT },
+  exercise_freq:   { type: DataTypes.ENUM('none', '1-2', '3+'), defaultValue: 'none' },
+  smoking_status:  { type: DataTypes.ENUM('none', 'quit', 'occasional', 'daily'), defaultValue: 'none' },
+  drinking_status: { type: DataTypes.ENUM('none', 'occasional', 'weekly', 'daily'), defaultValue: 'none' },
 
   // 既往史（JSON 存储）
- // 改后
-med_history:    { type: DataTypes.JSON },
-family_history: { type: DataTypes.JSON },
+  med_history:    { type: DataTypes.JSON, comment: '既往病史数组' },
+  family_history: { type: DataTypes.JSON, comment: '家族病史数组' },
   allergies:      { type: DataTypes.STRING(200), defaultValue: '' },
+
+  // ✅ 新增：补充健康信息（个性化Prompt需要）
+  medication:   { type: DataTypes.STRING(200), defaultValue: '', comment: '长期服药情况' },
+  stress_level: { type: DataTypes.ENUM('low', 'medium', 'high'), comment: '压力情况' },
+  other_notes:  { type: DataTypes.TEXT, defaultValue: '', comment: '其他补充说明' },
 
   // 健康目标文字描述
   health_goal: { type: DataTypes.TEXT, defaultValue: '' },
+  daily_tip:      { type: DataTypes.TEXT, defaultValue: '' },
+  daily_tip_date: { type: DataTypes.STRING(10), defaultValue: '' },
 }, { tableName: 'health_profiles' });
 
 // ============================================================
@@ -71,7 +80,7 @@ const Report = sequelize.define('Report', {
   report_date: { type: DataTypes.DATEONLY, comment: '体检日期' },
   hospital:    { type: DataTypes.STRING(100), defaultValue: '' },
 
-  // 云存储文件 ID（微信云存储）
+  // 云存储文件 ID
   file_id:     { type: DataTypes.STRING(500), defaultValue: '' },
 
   // 处理状态
@@ -79,59 +88,75 @@ const Report = sequelize.define('Report', {
     type: DataTypes.ENUM('pending', 'ocr_running', 'ocr_done', 'analyzed', 'report_ready', 'failed'),
     defaultValue: 'pending',
   },
+
   raw_text:     { type: DataTypes.TEXT('long'), comment: 'OCR 原始文本' },
-  report_cache: { type: DataTypes.JSON },
+
+  // ✅ 改：template_cache 替代 report_cache，按模板分key存
+  // 结构：{ comprehensive: { markdown, summary, healthScore }, personalized: { ... } }
+  template_cache: { type: DataTypes.JSON, comment: '各模板报告内容' },
+
+  // 保留 summary 和 health_score 存综合版的结果，用于首页展示
   summary:      { type: DataTypes.TEXT },
   health_score: { type: DataTypes.TINYINT.UNSIGNED },
 
-  error_msg:    { type: DataTypes.STRING(500), defaultValue: '' },
+  // ✅ 新增：整体风险等级，用于首页标签展示
+  overall_risk_level: {
+    type: DataTypes.ENUM('normal', 'mild', 'high'),
+    defaultValue: 'normal',
+    comment: '整体风险等级',
+  },
+
+  error_msg: { type: DataTypes.STRING(500), defaultValue: '' },
+  chief_complaint: { type: DataTypes.TEXT, defaultValue: '', comment: '主检建议原文' },
 }, { tableName: 'reports' });
 
 // ============================================================
 // 4. 健康指标表（长期趋势存储）
-//    每次上传报告后，关键指标存一条记录
-//    论文要求支持历史健康数据统计与可视化
 // ============================================================
 const Indicator = sequelize.define('Indicator', {
   id:          { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
   user_id:     { type: DataTypes.INTEGER, allowNull: false },
   report_id:   { type: DataTypes.INTEGER, allowNull: false },
 
-  indicator_key:   { type: DataTypes.STRING(50),  allowNull: false, comment: '指标英文key，如bloodGlucose' },
-  indicator_label: { type: DataTypes.STRING(50),  allowNull: false, comment: '指标中文名' },
-  value:           { type: DataTypes.FLOAT,        allowNull: false },
-  unit:            { type: DataTypes.STRING(20),   defaultValue: '' },
-  reference_range: { type: DataTypes.STRING(50),   defaultValue: '' },
+  indicator_key:   { type: DataTypes.STRING(50), allowNull: false, comment: '指标英文key，如bloodGlucose' },
+  indicator_label: { type: DataTypes.STRING(50), allowNull: false, comment: '指标中文名' },
+  value:           { type: DataTypes.FLOAT, allowNull: false },
+  unit:            { type: DataTypes.STRING(20), defaultValue: '' },
+  reference_range: { type: DataTypes.STRING(50), defaultValue: '' },
   normal_min:      { type: DataTypes.FLOAT },
   normal_max:      { type: DataTypes.FLOAT },
-  is_abnormal:     { type: DataTypes.BOOLEAN,      defaultValue: false },
-  record_date:     { type: DataTypes.DATEONLY,     allowNull: false, comment: '体检日期' },
+  is_abnormal:     { type: DataTypes.BOOLEAN, defaultValue: false },
+  record_date:     { type: DataTypes.DATEONLY, allowNull: false, comment: '体检日期' },
+
+  // ✅ 新增：是否为核心长期趋势指标
+  // true = 参与首页趋势图展示；false = 仅用于本次报告解读
+  is_core: { type: DataTypes.BOOLEAN, defaultValue: false, comment: '是否参与长期趋势统计' },
 }, { tableName: 'indicators' });
 
 // ============================================================
 // 5. 对话 Session 表
-//    session_type: 'report'（报告对话）| 'assistant'（日常助手）
 // ============================================================
 const ChatSession = sequelize.define('ChatSession', {
   id:           { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
   user_id:      { type: DataTypes.INTEGER, allowNull: false },
-  session_type: { type: DataTypes.ENUM('report', 'assistant'), allowNull: false },
+  session_type: { type: DataTypes.ENUM('report', 'assistant', 'goal'), allowNull: false },
   report_id:    { type: DataTypes.INTEGER, comment: '仅 report 类型有值' },
-  template_id:  { type: DataTypes.STRING(30), defaultValue: 'comprehensive' },
-  title:        { type: DataTypes.STRING(50), defaultValue: '新对话' },
+  template_id:  { type: DataTypes.STRING(30), defaultValue: 'comprehensive', comment: 'comprehensive | personalized' },
+  title:        { type: DataTypes.STRING(100), defaultValue: '新对话' },
   is_default:   { type: DataTypes.BOOLEAN, defaultValue: false },
   last_active:  { type: DataTypes.DATE, defaultValue: DataTypes.NOW },
 }, { tableName: 'chat_sessions' });
+
 
 // ============================================================
 // 6. 对话消息表
 // ============================================================
 const ChatMessage = sequelize.define('ChatMessage', {
-  id:         { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
-  session_id: { type: DataTypes.INTEGER, allowNull: false },
-  role:       { type: DataTypes.ENUM('user', 'assistant'), allowNull: false },
-  content:    { type: DataTypes.TEXT('long'), allowNull: false },
-  token_count:{ type: DataTypes.SMALLINT, defaultValue: 0 },
+  id:          { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+  session_id:  { type: DataTypes.INTEGER, allowNull: false },
+  role:        { type: DataTypes.ENUM('user', 'assistant'), allowNull: false },
+  content:     { type: DataTypes.TEXT('long'), allowNull: false },
+  token_count: { type: DataTypes.SMALLINT, defaultValue: 0 },
 }, { tableName: 'chat_messages' });
 
 // ============================================================
@@ -145,32 +170,33 @@ const HealthGoal = sequelize.define('HealthGoal', {
   target_days: { type: DataTypes.SMALLINT, defaultValue: 30 },
   source:      { type: DataTypes.ENUM('ai', 'user'), defaultValue: 'user', comment: 'AI生成或用户自建' },
   status:      { type: DataTypes.ENUM('active', 'archived', 'completed'), defaultValue: 'active' },
-  // 颜色区分：ai=绿色标签 user=黄色标签（论文要求）
+  // 颜色区分：ai=绿色标签 user=黄色标签
 }, { tableName: 'health_goals' });
 
 // ============================================================
-// 8. 目标任务表（从属于 goal）
+// 8. 目标任务表
 // ============================================================
 const GoalTask = sequelize.define('GoalTask', {
-  id:        { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
-  goal_id:   { type: DataTypes.INTEGER, allowNull: false },
-  user_id:   { type: DataTypes.INTEGER, allowNull: false },
-  title:     { type: DataTypes.STRING(100), allowNull: false },
-  frequency: { type: DataTypes.STRING(20), defaultValue: '每天' },
-  sort_order:{ type: DataTypes.TINYINT, defaultValue: 0 },
+  id:         { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+  goal_id:    { type: DataTypes.INTEGER, allowNull: false },
+  user_id:    { type: DataTypes.INTEGER, allowNull: false },
+  title:      { type: DataTypes.STRING(100), allowNull: false },
+  frequency:  { type: DataTypes.STRING(20), defaultValue: '每天' },
+  sort_order: { type: DataTypes.TINYINT, defaultValue: 0 },
+  source:     { type: DataTypes.ENUM('ai', 'user'), defaultValue: 'user', comment: 'AI生成或用户编辑' },
 }, { tableName: 'goal_tasks' });
 
 // ============================================================
-// 9. 打卡记录表（论文要求：日常健康行为打卡）
+// 9. 打卡记录表
 // ============================================================
 const CheckinRecord = sequelize.define('CheckinRecord', {
-  id:       { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
-  user_id:  { type: DataTypes.INTEGER, allowNull: false },
-  goal_id:  { type: DataTypes.INTEGER, allowNull: false },
-  task_id:  { type: DataTypes.INTEGER, allowNull: false },
-  done:     { type: DataTypes.BOOLEAN, defaultValue: true },
+  id:           { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+  user_id:      { type: DataTypes.INTEGER, allowNull: false },
+  goal_id:      { type: DataTypes.INTEGER, allowNull: false },
+  task_id:      { type: DataTypes.INTEGER, allowNull: false },
+  done:         { type: DataTypes.BOOLEAN, defaultValue: true },
   checkin_date: { type: DataTypes.DATEONLY, allowNull: false },
-  note:     { type: DataTypes.STRING(200), defaultValue: '' },
+  note:         { type: DataTypes.STRING(200), defaultValue: '' },
 }, {
   tableName: 'checkin_records',
   indexes: [{ unique: true, fields: ['user_id', 'task_id', 'checkin_date'] }],
